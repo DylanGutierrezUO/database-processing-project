@@ -1,10 +1,11 @@
+# db.py
+# Only implemented __init__ and create_table for M1
 from lstore.table import Table
 
 class Database():
 
     def __init__(self):
-        self.tables = []
-        pass
+        self._tables_by_name = {}
 
     # Not required for milestone1
     def open(self, path):
@@ -19,9 +20,11 @@ class Database():
     :param num_columns: int     #Number of Columns: all columns are integer
     :param key: int             #Index of table key in columns
     """
-    def create_table(self, name, num_columns, key_index):
-        table = Table(name, num_columns, key_index)
-        return table
+    # Make a table and remember it by name
+    def create_table(self, name: str, num_columns: int, key: int) -> Table:
+        t = Table(name, num_columns, key)
+        self._tables_by_name[name] = t
+        return t
 
     
     """
