@@ -40,6 +40,8 @@ class Table:
 
         # fast key lookup for M1 (very basic)
         self._key_to_rid: Dict[int, int] = {}
+        # snapshot of each row *as it looked when inserted* (used by versioned reads)
+        self._original_rows: Dict[int, List[int]] = {} 
 
         # placeholder
         self.index = Index(self)
@@ -80,6 +82,7 @@ class Table:
 
         self.page_directory[rid] = locs
         self._key_to_rid[pk] = rid
+        self._original_rows[pk] = list(values) # <- stash original row at insert time
         return rid
 
     # ---- READ one value ----
@@ -115,6 +118,7 @@ class Table:
         if rid is None:
             return False
         self.page_directory.pop(rid, None)
+        self._original_rows.pop(key_value, None)    # <- forget the snapshot too
         return True
 
     # ---- helpers used by Query ----
@@ -132,7 +136,14 @@ class Table:
                 v = self.read(rid, column)
                 total += 0 if v is None else v
         return total if matched else 0
+    
+    # ---- helpers used to find original rows ----
+    def get_original_row(self, key_value: int) -> Optional[List[int]]:
+        # Give me the row as it looked right after insert (before any updates)
+        # Returns a copy so callers can't accidentally mutate our snapshot
+        row = self._original_rows.get(key_value)
+        return None if row is None else list(row)  # return a copy
 
-    # merge placeholder (not used in M1)
+    # merge placeholder
     def __merge(self):
         pass

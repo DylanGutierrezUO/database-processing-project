@@ -98,8 +98,23 @@ class Query:
     # Returns False if record locked by TPL
     # Assume that select will never be called on a key that doesn't exist
     """
-    def select_version(self, search_key, search_key_index, projected_columns_index, relative_version):
-        pass
+    def select_version(self, search_key: int, search_column: int,
+                    query_columns: List[int], relative_version: int):
+        # If relative_version >= 0: just return the current row (same as select())
+        # If relative_version  < 0: return the original row we snapped at insert
+        if relative_version >= 0:
+            return self.select(search_key, search_column, query_columns)
+
+        # negative version
+        rid = self.table.rid_for_key(int(search_key))
+        if rid is None:
+            return []
+        orig = self.table.get_original_row(int(search_key))
+        if orig is None:
+            return []
+
+        projected = [v for v, m in zip(orig, query_columns)] if query_columns else orig
+        return [Record(rid, search_key, projected)]
 
     
     """
@@ -151,8 +166,19 @@ class Query:
     # Returns the summation of the given range upon success
     # Returns False if no record exists in the given range
     """
-    def sum_version(self, start_range, end_range, aggregate_column_index, relative_version):
-        pass
+    def sum_version(self, start_key: int, end_key: int, column: int, relative_version: int):
+        if relative_version >= 0:
+            return self.sum(start_key, end_key, column)
+
+        total = 0
+        for k in self.table._key_to_rid.keys():
+            # If relative_version >= 0: sum the current values (same as sum())
+            # If relative_version  < 0: sum the original values from the snapshots
+            if start_key <= k <= end_key:
+                row = self.table.get_original_row(k)
+                if row is not None and 0 <= column < self.table.num_columns:
+                    total += row[column]
+        return total
 
     
     """
