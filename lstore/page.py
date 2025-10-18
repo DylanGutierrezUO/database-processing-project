@@ -19,6 +19,12 @@ class Page:
         return self.num_records < self.CAPACITY
 
     def write(self, value: int) -> Optional[int]:
+        """
+        Append one integer to the end of this page.
+        Returns the slot index (0..511), or None if the page is full.
+        The Table will remember which page this value went to
+        and which slot it's in so it can find it later
+        """
         if not self.has_capacity():
             return None
 
@@ -32,3 +38,14 @@ class Page:
 
         self.num_records += 1
         return slot
+
+    def read(self, slot: int) -> int:
+        # grab the int at a slot (Table can use this when doing selects)
+        if not (0 <= slot < self.num_records):
+            raise IndexError("slot out of range")
+        start = slot * self.CELL_SIZE_BYTES
+        return int.from_bytes(
+            self.data[start:start + self.CELL_SIZE_BYTES],
+            byteorder="little",
+            signed=True,
+        )
