@@ -38,4 +38,4 @@ class Database():
     # Returns table with the passed name
     """
     def get_table(self, name):
-        pass
+        return self._tables_by_name.get(name, None)
