@@ -29,9 +29,12 @@ class Database():
     
     """
     # Deletes the specified table
+    :param name: string    #Name of the table to delete
+    :return: None
     """
     def drop_table(self, name):
-        pass
+        if name in self._tables_by_name:
+            del self._tables_by_name[name]
 
     
     """
