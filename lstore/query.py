@@ -23,11 +23,11 @@ class Query:
     
     """
     # internal Method
-    # Read a record with specified RID
+    # Delete a record with specified RID
     # Returns True upon succesful deletion
     # Return False if record doesn't exist or is locked due to 2PL
     """
-    def delete(self, primary_key):
+    def delete(self, primary_key) -> bool:
         pass
     
     
