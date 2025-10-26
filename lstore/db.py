@@ -7,7 +7,6 @@ class Database():
     def __init__(self):
         self._tables_by_name = {}
 
-    # Not required for milestone1
     def open(self, path):
         pass
 
@@ -31,11 +30,12 @@ class Database():
     # Deletes the specified table
     """
     def drop_table(self, name):
-        pass
+        if name in self._tables_by_name:
+            del self._tables_by_name[name]
 
     
     """
     # Returns table with the passed name
     """
     def get_table(self, name):
-        pass
+        return self._tables_by_name.get(name, None)
