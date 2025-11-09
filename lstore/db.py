@@ -1,11 +1,11 @@
-# db.py
-# Only implemented __init__ and create_table for M1
-from lstore.table import Table
+from .table import Table
+from .pagebuffer import Bufferpool
 
 class Database():
 
     def __init__(self):
-        self._tables_by_name = {}
+        self.tables = []
+        self.bufferpool = Bufferpool(self)
 
     def open(self, path):
         pass
@@ -19,23 +19,29 @@ class Database():
     :param num_columns: int     #Number of Columns: all columns are integer
     :param key: int             #Index of table key in columns
     """
-    # Make a table and remember it by name
-    def create_table(self, name: str, num_columns: int, key: int) -> Table:
-        t = Table(name, num_columns, key)
-        self._tables_by_name[name] = t
-        return t
+    def create_table(self, name, num_columns, key_index):
+        table = Table(name, num_columns, key_index)
+        table.link_page_buffer(self.bufferpool)
+        return table
 
     
     """
     # Deletes the specified table
     """
     def drop_table(self, name):
-        if name in self._tables_by_name:
-            del self._tables_by_name[name]
+        for i, table in enumerate(self.tables):
+            if table.name == name:
+                self.tables[i].delete() # Call delete method to clean up resources
+                del self.tables[i]
+                return
+        raise ValueError("Table not found")
 
     
     """
     # Returns table with the passed name
     """
     def get_table(self, name):
-        return self._tables_by_name.get(name, None)
+        for table in self.tables:
+            if table.name == name:
+                return table
+        raise ValueError("Table not found")
