@@ -7,210 +7,530 @@ import json
 
 
 class Record:
+    """
+    Lightweight record container used by Query.
 
+    Behaves list-like so external tests that compare a Record directly to a
+    Python list/tuple (e.g., `if record != [ ... ]`) work as intended.
+    """
     def __init__(self, rid, key, columns):
-        self.rid = rid
-        self.key = key
-        self.columns = columns
+        self.rid = rid                 # base/tail RID (not used by testers)
+        self.key = key                 # PK value (optional)
+        self.columns = list(columns)   # user columns only (no meta)
+
+    # --- list-like behavior for friendlier testing ---
+    def __len__(self):
+        return len(self.columns)
+
+    def __iter__(self):
+        return iter(self.columns)
+
+    def __getitem__(self, idx):
+        return self.columns[idx]
+
+    def __repr__(self):
+        # Print like a plain list for clean diffs in tester messages
+        return repr(self.columns)
+
+    def __eq__(self, other):
+        # Equal to another Record with same columns, or to a list/tuple
+        if isinstance(other, Record):
+            return self.columns == other.columns
+        try:
+            return list(self.columns) == list(other)
+        except TypeError:
+            return False
+
 
 class IndirectionEntry:
-    def __init__(self, pageType:int, rid):
-        self.pageType = pageType # 0 for base page, 1 for tail page
-        self.rid = rid 
+    """
+    Compatibility holder (not heavily used in A2).
+    Attributes:
+        pageType (int): 0 for base page, 1 for tail page.
+        rid (int|str): RID referred to by this entry.
+    """
+    def __init__(self, pageType: int, rid):
+        self.pageType = pageType  # 0 for base page, 1 for tail page
+        self.rid = rid
+
 
 class Table:
     """
-    :param name: string         #Table name
-    :param num_columns: int     #Number of Columns: all columns are integer
-    :param key: int             #Index of table key in columns
+    Column-store table with base/tail records and lazy recovery.
+
+    Args:
+        name (str): Logical table name (also becomes the subfolder name under DATA_DIR).
+        num_columns (int): Number of USER columns (excludes meta columns).
+        key (int): 0-based primary key index among the user columns.
+
+    Attributes:
+        page_directory (dict): RID -> list[(page_id, slot)] of length META+user columns.
+        base_record_count (int): Number of base records appended.
+        tail_record_count (int): Number of tail records appended.
+        index (Index): Per-column secondary indexes (PK is built by default).
+        pageBuffer (Bufferpool|None): Set by Database to perform I/O.
     """
+
     def __init__(self, name, num_columns, key):
         self.name = name
         self.key = key
-        self.num_columns = num_columns + 4 # Add 4 for metadata columns
-        self.page_directory = {} # RID: (List of page locations)
-        self.base_record_count = int(0) # Counter for base records
-        self.tail_record_count = int(0) # Counter for tail records
+        self.num_columns = num_columns         # user columns
+        self.page_directory = {}               # RID -> List[(page_id, slot)] length META+user
+        self.base_record_count = int(0)        # Counter for base records
+        self.tail_record_count = int(0)        # Counter for tail records
         self.index = Index(self)
-        self.pageBuffer = None # Will be set when table is added to database
+        self.pageBuffer = None                 # Set by database
+        self.deleted = set()                   # base RIDs logically deleted this run
 
     def link_page_buffer(self, pageBuffer):
+        """
+        Connect this table to the process-wide buffer pool.
+
+        Args:
+            pageBuffer (Bufferpool): Shared buffer manager provided by Database.
+        """
         self.pageBuffer = pageBuffer
         return
-        
+
+    # ---------- helpers ----------
+
+    def _total_cols(self):
+        """
+        Total physical columns = META columns + user columns.
+
+        Returns:
+            int: Total number of physical columns per row.
+        """
+        return config.META_COLUMNS + self.num_columns
+    
+    def _page_id(self, col_index: int, page_number: int, is_base: bool) -> str:
+        """
+        Canonical page identifier used by Bufferpool and on-disk filenames.
+        Format: "<table>_<col>_<pageNo>_<isBase(0|1)>"
+        """
+        return f"{self.name}_{col_index}_{page_number}_{1 if is_base else 0}"
+
+    def _ts_millis(self):
+        """
+        Current wall-clock time in epoch milliseconds (for TIMESTAMP column).
+        """
+        return int(time.time() * 1000)
+
+    def _generate_rid(self, page_type):
+        """
+        Allocate the next base or tail RID.
+
+        Base RIDs grow from 0..N-1. Tail RIDs occupy a disjoint space starting
+        at config.TAIL_RID_START.
+
+        Args:
+            page_type (str): "base" or "tail".
+
+        Returns:
+            int: Newly allocated RID.
+        """
+        if page_type == "base":
+            # next base RID == current base count (increment happens after write)
+            return self.base_record_count
+        else:
+            # tails live in a disjoint RID space starting at TAIL_RID_START
+            base = getattr(config, "TAIL_RID_START", 10**9)
+            return base + self.tail_record_count
+
+    def _is_base_rid(self, rid):
+        """Return True iff rid is a base RID (not a tail)."""
+        if isinstance(rid, str):
+            return rid.startswith('b')
+        try:
+            return int(rid) < getattr(config, "TAIL_RID_START", 10**9)
+        except Exception:
+            return False
+
+    def _ensure_dir_entry(self, rid):
+        """
+        Ensure there is a page_directory row for 'rid'.
+
+        Creates a placeholder list of (page_id, slot) pairs for META+user columns.
+        """
+        if rid not in self.page_directory:
+            self.page_directory[rid] = [None] * self._total_cols()
+
+    def _read_cell(self, rid, col_index):
+        """
+        Read a single cell value by (rid, physical column index).
+
+        Args:
+            rid (int|str): Base or tail RID.
+            col_index (int): Physical column index (0..META+user-1).
+
+        Returns:
+            int: Stored integer value.
+        """
+        pid, slot = self.page_directory[rid][col_index]
+        page = self.pageBuffer.get_page(pid)
+        try:
+            return page.read(slot)
+        finally:
+            # get_page does not pin; caller may pin/unpin if needed elsewhere
+            pass
+
+    def _write_indirection(self, base_rid, new_tail_rid):
+        """
+        Overwrite the base row's INDIRECTION cell with the latest tail RID.
+
+        Args:
+            base_rid (int): Target base RID.
+            new_tail_rid (int): Newly appended tail RID that now represents 'latest'.
+        """
+        pid, slot = self.page_directory[base_rid][config.INDIRECTION_COLUMN]
+        page = self.pageBuffer.get_page(pid)
+        # pin/mark/unpin as per Bufferpool contract
+        self.pageBuffer.pin_page(pid)
+        page.data[slot] = new_tail_rid
+        self.pageBuffer.mark_dirty(pid)
+        self.pageBuffer.unpin_page(pid)
+
+    def _get_latest_rid(self, base_rid):
+        """
+        Return the RID of the latest version for a base record.
+
+        If INDIRECTION is 0, the base row is the latest; otherwise follow it.
+        """
+        indir = self._read_cell(base_rid, config.INDIRECTION_COLUMN)
+        return base_rid if indir == 0 else indir
+
+    def _materialize_latest_user_values(self, base_rid):
+        """
+        Build a full, user-columns-only view of the latest version.
+
+        Args:
+            base_rid (int): Base RID whose latest values are requested.
+
+        Returns:
+            list[int]: Values for all user columns, in user-column order.
+        """
+        latest = self._get_latest_rid(base_rid)
+        vals = []
+        for c in range(config.META_COLUMNS, config.META_COLUMNS + self.num_columns):
+            pid, slot = self.page_directory[latest][c]
+            page = self.pageBuffer.get_page(pid)
+            vals.append(page.read(slot))
+        return vals
+
+    # ---------- insert ----------
+
     def insert_row(self, *columns):
         """
-        Insert a new row into the table's base pages
-        :param columns: int[]   # List of values for each user column
-        :return: bool          # True if insert was successful
+        Append a new base record; enforces PK uniqueness.
         """
-        # Validate number of columns matches expected
-        if len(columns) != self.num_columns - 4:  # Subtract metadata columns
+        user_cols = self.num_columns
+        if len(columns) != user_cols:
             return False
-            
-        # Generate new RID for a base record
+
+        pk_val = columns[self.key]
+
+        # Fast path: PK index exists
+        pk_idx = self.index.indices[self.key]
+        if pk_idx is not None and pk_val in pk_idx:
+            return False
+
+        # Fallback: scan base key cells (PK is immutable)
+        if pk_idx is None:
+            key_col = config.META_COLUMNS + self.key
+            for rid in self.page_directory.keys():
+                if not self._is_base_rid(rid) or (rid in self.deleted):
+                    continue
+                pid, slot = self.page_directory[rid][key_col]
+                page = self.pageBuffer.get_page(pid)
+                if page.read(slot) == pk_val:
+                    return False
+
+        # Generate new base RID
         rid = self._generate_rid("base")
-        
-        # Create metadata
-        indirection = IndirectionEntry(0, rid)  # Points to self initially
-        timestamp = int(time() * 1000)  # Current time in milliseconds
-        schema_encoding = '0' * (self.num_columns - 4)  # All columns unmodified
-        
-        # Combine metadata and user columns
+
+        # Metadata (ints)
+        indirection = 0
+        timestamp = self._ts_millis()
+        schema_encoding = 0
+
         full_record = [indirection, rid, timestamp, schema_encoding] + list(columns)
-        
+
         # Write to base pages
         self._write_to_base_pages(rid, full_record)
-        
-        # Update index for every indexed column
-        for col_index in range(self.num_columns - 4):
-            if self.index.indices[col_index] is not None:
+
+        # Update indices (PK and any others)
+        for col_index in range(user_cols):
+            if getattr(self.index, "indices", None) and self.index.indices[col_index] is not None:
                 self.index.insert_entry(rid, col_index, columns[col_index])
-        
+
         return True
-    
-    def _generate_rid(self, page_type):
-        if page_type == "base":
-            return f"b{self.base_record_count}"
-        else:
-            return f"t{self.tail_record_count}"
-        
+
     def _write_to_base_pages(self, rid, full_record):
-        # Determine which page to write to based on current record count
+        """
+        Physically append the record to base pages (META+user columns).
+
+        One value per physical column is appended into the page numbered by the
+        current base_record_count // MAX_RECORDS_PER_PAGE.
+
+        Args:
+            rid (int): Newly assigned base RID.
+            full_record (list[int]): META columns + user columns.
+        """
         page_number = self.base_record_count // config.MAX_RECORDS_PER_PAGE
-        #For each column, write to the corresponding page
-        for col_index in range(self.num_columns + 4):
-            page_id = f"{self.name}_{col_index}_{page_number}_1"  # Base page
-            page = self.pageBuffer.get_page(page_id)  # Load page into buffer
-            self.pageBuffer.pin_page(page_id)  # Pin page in buffer
-            slot = page.write(full_record[col_index])  # Write user column value
-            self.pageBuffer.set_dirty(page_id)  # Mark page as dirty
-            self.pageBuffer.unpin_page(page_id)  # Unpin page in buffer
-            if self.page_directory[rid] == None: # Initialize directory entry if it doesn't exist
-                self.page_directory[rid] = [] * self.num_columns + 4
-            self.page_directory[rid][col_index] = (page_id, slot)  # Update directory with RID location
-        
-        # Increment base record count
+        self._ensure_dir_entry(rid)
+        # Write all meta+user columns
+        for col_index in range(self._total_cols()):
+            page_id = self._page_id(col_index, page_number, is_base=True)
+            page = self.pageBuffer.get_page(page_id)
+            self.pageBuffer.pin_page(page_id)
+            slot = page.write(full_record[col_index])
+            self.pageBuffer.mark_dirty(page_id)
+            self.pageBuffer.unpin_page(page_id)
+            self.page_directory[rid][col_index] = (page_id, slot)
         self.base_record_count += 1
 
-    def _write_to_tail_pages(self, rid, full_record):
-        # Determine which page to write to based on current record count
+    def _write_to_tail_pages(self, tail_rid, full_record):
+        """
+        Physically append a tail snapshot across all columns.
+
+        Args:
+            tail_rid (int): Newly assigned tail RID.
+            full_record (list[int]): META columns + user columns (cumulative).
+        """
         page_number = self.tail_record_count // config.MAX_RECORDS_PER_PAGE
-        # For each column, write to the corresponding tail page
-        for col_index in range(self.num_columns + 4):
-            page_id = f"{self.name}_{col_index}_{page_number}_0"  # Tail page
-            page = self.pageBuffer.get_page(page_id)  # Load page into buffer
-            self.pageBuffer.pin_page(page_id)  # Pin page in buffer
-            slot = page.write(full_record[col_index])  # Write user column value
-            self.pageBuffer.set_dirty(page_id)  # Mark page as dirty
-            self.pageBuffer.unpin_page(page_id)  # Unpin page in buffer
-            if self.page_directory[rid] == None: # Initialize directory entry if it doesn't exist
-                self.page_directory[rid] = [] * self.num_columns + 4
-            self.page_directory[rid][col_index] = (page_id, slot)  # Update directory with RID location
-        
-        # Increment tail record count
+        self._ensure_dir_entry(tail_rid)
+        for col_index in range(self._total_cols()):
+            page_id = self._page_id(col_index, page_number, is_base=False)
+            page = self.pageBuffer.get_page(page_id)
+            self.pageBuffer.pin_page(page_id)
+            slot = page.write(full_record[col_index])
+            self.pageBuffer.mark_dirty(page_id)
+            self.pageBuffer.unpin_page(page_id)
+            self.page_directory[tail_rid][col_index] = (page_id, slot)
         self.tail_record_count += 1
 
-    def update_row(self, rid, *columns): # TODO
+    # ---------- update (cumulative tail snapshot) ----------
+
+    def update_row(self, base_rid, *columns):
         """
-        Update an existing row in the table's tail pages
-        Use once per column changed, as this is designed to be called 
-        multiple times of multiple columns are changed at once.
-        :param rid: string       # RID of the record to update
-        :param columns: int[]    # List of new values for each user column
-        :return: bool            # True if update was successful
+        Write a cumulative tail record for `base_rid`.
+        `columns` is a full user-length vector where None means "no change".
+        Returns True on success; False on any contract violation.
         """
-        # Validate number of columns matches expected
-        if len(columns) != self.num_columns - 4:
+        try:
+            user_cols = self.num_columns
+            if len(columns) != user_cols:
+                return False
+            if base_rid not in self.page_directory:
+                return False
+
+            # ---- helpers (local) ----
+            def _read_user_values_for_rid(rid):
+                vals = []
+                for i in range(user_cols):
+                    pid, slot = self.page_directory[rid][4 + i]
+                    vals.append(self.pageBuffer.get_page(pid).read(slot))
+                return vals
+
+            def _latest_rid_for_base(rid0):
+                # Base's INDIRECTION points to latest tail (0 if none).
+                pid, slot = self.page_directory[rid0][config.INDIRECTION_COLUMN]
+                latest = self.pageBuffer.get_page(pid).read(slot)
+                return rid0 if (latest in (0, None)) else latest
+
+            # ---- materialize current latest ----
+            latest_rid = _latest_rid_for_base(base_rid)
+            current = _read_user_values_for_rid(latest_rid)
+
+            # ---- fill new values + build bitmask (int) ----
+            new_vals = list(current)
+            bitmask = 0
+            for i, v in enumerate(columns):
+                if v is not None and v != current[i]:
+                    new_vals[i] = int(v)
+                    bitmask |= (1 << i)
+
+            if bitmask == 0:
+                return True  # no-op update
+
+            # ---- craft the tail record (cumulative) ----
+            new_tail_rid = self._generate_rid("tail")
+            ts = int(time.time() * 1000)
+            prev_ptr = latest_rid if latest_rid != base_rid else 0  # 0 signals base
+
+            full_tail = [prev_ptr, new_tail_rid, ts, bitmask] + new_vals
+            self._write_to_tail_pages(new_tail_rid, full_tail)
+
+            # ---- bump base indirection to the NEW tail (in place) ----
+            pid, slot = self.page_directory[base_rid][config.INDIRECTION_COLUMN]
+            page = self.pageBuffer.get_page(pid)
+            page.write_at(slot, new_tail_rid)
+            self.pageBuffer.mark_dirty(pid)
+
+            return True
+        except Exception:
             return False
-        
-        # Check if record exists in page directory
-        if rid not in self.page_directory:
-            return False
-        
-        # Generate new RID for a tail record
-        new_rid = self._generate_rid("tail")
 
-        original_record = []
-        
-        for col_index in range(self.num_columns + 4):
-            # Get base record location
-            base_page_id, base_slot = self.page_directory[rid][col_index]
-            base_page = self.pageBuffer.get_page(base_page_id)
-            base_value = base_page.read(base_slot)
-            original_record.append(base_value)
+    # ---------- buffer hooks for Bufferpool ----------
 
-        # Check if any columns have been updated before from schema encoding
-        originalSchema = original_record[config.SCHEMA_ENCODING_COLUMN]
-        
-        # Schema for this update
-        schema_encoding = ''.join(['1' if columns[i] != original_record[i + 4] else '0' for i in range(self.num_columns - 4)])
-        
-        beenUpdatedBefore = False if '1' in schema_encoding else False # Base record has been updated before 
-
-        if not beenUpdatedBefore:
-            # Insert additional tail record with original values for unchanged columns
-            firstTailRid = self._generate_rid("tail")
-            first_tail_record = [IndirectionEntry(1, rid), firstTailRid, int(time() * 1000), schema_encoding] + original_record[4:]
-            self._write_to_tail_pages(firstTailRid, first_tail_record)
-            
-
-        # Get latest tail page
-        prev_record = []
-        for col_index in range(self.num_columns + 4):
-            # Get prev record location
-            prev_page_id, prev_slot = self.page_directory[rid][col_index]
-            prev_page = self.pageBuffer.get_page(prev_page_id)
-            value = prev_page.read(prev_slot)
-            prev_record.append(value)
-
-        
-
-
-
-        # Get latest tail record
-        latest_tail_rid = original_record[config.INDIRECTION_COLUMN]
-        
-        timestamp = int(time() * 1000)  # Current time in milliseconds
-
-        cumulative_columns = [columns[i] if columns[i] != original_record[i + 4] else original_record[i + 4] for i in range(self.num_columns - 4)]
-        
-        # Combine metadata and user columns
-        full_record = [indirection, new_rid, timestamp, schema_encoding] + list(columns)
-        
-        # Write to tail pages
-        self._write_to_tail_pages(new_rid, full_record)
-        
-        return True
-    
     def get_page(self, page_id):
         '''
-        Retrieves the specified page from disk for bufferpool.
+        Retrieve the specified page from disk (Bufferpool hook).
+
+        Args:
+            page_id (str): Canonical underscore page identifier.
+
+        Returns:
+            Page: Loaded Page instance or an empty Page if the file is absent.
         '''
-        page_path = os.path.join(config.DATA_DIR, self.name, page_id)
+        # honor DATA_DIR and file suffix
+        dir_path = os.path.join(config.DATA_DIR, self.name)
+        os.makedirs(dir_path, exist_ok=True)
+        page_path = os.path.join(dir_path, f"{page_id}{getattr(config, 'PAGE_FILE_SUFFIX', '.page.json')}")
         if not os.path.exists(page_path):
             return Page()  # Return an empty page if it doesn't exist
-        with open(page_path, 'rb') as f:
+        with open(page_path, 'r') as f:
             page_data = json.load(f)
             page = Page()
             page.fromJSON(page_data)
             return page
-        
+
     def write_page(self, page_id, page):
         '''
-        Writes the specified page to disk.
+        Persist the specified page to disk (Bufferpool hook).
+
+        Args:
+            page_id (str): Canonical underscore page identifier.
+            page (Page): Page instance to serialize.
         '''
-        page_path = os.path.join(config.DATA_DIR, self.name, page_id)
-        os.makedirs(os.path.dirname(page_path), exist_ok=True)
+        dir_path = os.path.join(config.DATA_DIR, self.name)
+        os.makedirs(dir_path, exist_ok=True)
+        page_path = os.path.join(dir_path, f"{page_id}{getattr(config, 'PAGE_FILE_SUFFIX', '.page.json')}")
         with open(page_path, 'w') as f:
             json.dump(page.toJSON(), f)
 
+    def recover(self):
+        """
+        Rebuild page_directory, base/tail counters, and the default key index
+        from pages stored on disk under DATA_DIR/<table>/.
+
+        Assumes underscore page-id:
+            <table>_<col>_<pageNo>_<isBase(0|1)> + PAGE_FILE_SUFFIX
+
+        Strategy:
+            1) Scan only RID-column pages to enumerate RIDs and slots per page.
+            2) For each enumerated (rid, slot, page_no, is_base), populate the
+               directory for ALL physical columns on that page number.
+            3) Derive base_record_count and tail_record_count from observed RIDs.
+            4) Rebuild the primary-key index.
+        """
+        dir_path = os.path.join(config.DATA_DIR, self.name)
+        suffix = getattr(config, "PAGE_FILE_SUFFIX", ".page.json")
+
+        if not os.path.isdir(dir_path):
+            # nothing persisted yet
+            self.page_directory = {}
+            self.base_record_count = 0
+            self.tail_record_count = 0
+            self.index = Index(self)  # creates empty PK index
+            return
+
+        # reset in-memory structures
+        self.page_directory = {}
+        self.base_record_count = 0
+        self.tail_record_count = 0
+        total_cols = config.META_COLUMNS + self.num_columns
+        tail_start = getattr(config, "TAIL_RID_START", 10**9)
+        max_tail_seq = -1   # for next tail rid calc
+
+        # First pass: scan RID-column pages (meta col = config.RID_COLUMN) for base and tail
+        for fname in os.listdir(dir_path):
+            if not fname.endswith(suffix):
+                continue
+            page_id = fname[: -len(suffix)]
+            parts = page_id.split('_')
+            if len(parts) != 4:
+                continue
+            tname, col_str, page_str, is_base_str = parts
+            if tname != self.name:
+                continue
+
+            col_index = int(col_str)
+            page_no = int(page_str)
+            is_base = bool(int(is_base_str))
+
+            # Only read RID column pages to enumerate RIDs and slots on this page
+            if col_index != config.RID_COLUMN:
+                continue
+
+            # Load the RID page
+            with open(os.path.join(dir_path, fname), "r") as f:
+                obj = json.load(f)
+            p = Page()
+            p.fromJSON(obj)
+
+            # For each slot with a RID, bind ALL columns at the same slot on that page_no
+            for slot in range(p.num_records):
+                try:
+                    rid_val = int(p.read(slot))
+                except Exception:
+                    continue
+
+                if rid_val not in self.page_directory:
+                    self.page_directory[rid_val] = [None] * total_cols
+
+                for c in range(total_cols):
+                    pid_c = f"{self.name}_{c}_{page_no}_{1 if is_base else 0}"
+                    self.page_directory[rid_val][c] = (pid_c, slot)
+
+                if is_base:
+                    # base RIDs are 0..N-1; keep next-id as max+1
+                    if isinstance(rid_val, int):
+                        self.base_record_count = max(self.base_record_count, rid_val + 1)
+                else:
+                    # tails start at TAIL_RID_START; track the highest tail sequence
+                    if rid_val >= tail_start:
+                        max_tail_seq = max(max_tail_seq, rid_val - tail_start)
+
+        # set tail_record_count for next tail rid issuance
+        self.tail_record_count = (max_tail_seq + 1) if max_tail_seq >= 0 else 0
+
+        # Rebuild the default key index from the directory
+        self.index = Index(self)
+
+    def merge(self):
+        """Lazy close-time merge of latest values back into base rows."""
+        for rid in list(self.page_directory.keys()):
+            if not self._is_base_rid(rid) or (rid in self.deleted):
+                continue
+            latest_vals = self._materialize_latest_user_values(rid)
+
+            # write user columns back to base slots
+            for i, v in enumerate(latest_vals):
+                pid, slot = self.page_directory[rid][config.META_COLUMNS + i]
+                page = self.pageBuffer.get_page(pid)
+                self.pageBuffer.pin_page(pid)
+                page.data[slot] = int(v)
+                self.pageBuffer.mark_dirty(pid)
+                self.pageBuffer.unpin_page(pid)
+
+            # reset indirection and schema on base row
+            pid, slot = self.page_directory[rid][config.INDIRECTION_COLUMN]
+            page = self.pageBuffer.get_page(pid)
+            self.pageBuffer.pin_page(pid); page.data[slot] = 0
+            self.pageBuffer.mark_dirty(pid); self.pageBuffer.unpin_page(pid)
+
+            pid, slot = self.page_directory[rid][config.SCHEMA_ENCODING_COLUMN]
+            page = self.pageBuffer.get_page(pid)
+            self.pageBuffer.pin_page(pid); page.data[slot] = 0
+            self.pageBuffer.mark_dirty(pid); self.pageBuffer.unpin_page(pid)
 
     def __merge(self):
-        print("merge is happening")
-        pass
+        self.merge()
 
     def delete(self):
+        """
+        Table-level cleanup hook.
+        """
         # Clean up resources, if needed
         pass
- 
