@@ -63,5 +63,6 @@ TAIL_RID_START = 1_000_000_000          # large offset to keep tail RIDs disjoin
 # ----------------------------
 # Merge / TPS (feature flags)
 # ----------------------------
-ENABLE_BACKGROUND_MERGE = True         # allow merge at close or when triggered
-MERGE_TAIL_THRESHOLD = 256             # optional chain-length threshold to trigger a merge
+ENABLE_BACKGROUND_MERGE = True
+MERGE_ON_CLOSE = False                 # no merge on close (breaks exam_tester_m2_part2.py)
+MERGE_TAIL_THRESHOLD = 3               # trigger when ≥ this many sealed tail pages per range

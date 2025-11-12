@@ -354,14 +354,13 @@ class Query:
         """
         Versioned SELECT on the primary key.
 
-        Convention for `relative_version`:
-            0  -> latest version
-        -1  -> previous version
-        -k  -> k-th previous version (clamped at base)
+        Convention used by the exam (and supported here):
+            0   -> latest version
+        -1   -> previous version
+        -k   -> k-th previous version (clamped at base)
 
-        Returns:
-            list[Record]: one Record with user columns projected by mask,
-                        or [] if the key doesn’t exist / is deleted.
+        We map the above to a non-negative version index for the composer:
+            rv_index = max(0, -relative_version)
         """
         try:
             # If not querying on PK, just delegate to regular select()
@@ -376,11 +375,13 @@ class Query:
             if base_rid is None or base_rid in getattr(self.table, "deleted", set()):
                 return []
 
-            # Materialize the requested version via bitmask replay (helper below)
-            row = self._materialize_version_values(base_rid, int(relative_version))
+            # Compose the row at the requested relative version
+            rv_in = int(relative_version)
+            rv_index = (0 if rv_in >= 0 else -rv_in)  # 0->0, -1->1, -k->k
+            full_row = self._compose_row_at_version(base_rid, rv_index)
 
             # Wrap in Record with projection applied
-            return self._make_records([row], proj)
+            return self._make_records([full_row], proj)
         except Exception:
             # Tester indexes [0]; return [] on any failure to avoid TypeErrors
             return []
@@ -430,12 +431,14 @@ class Query:
     def sum_version(self, start_range, end_range, aggregate_column_index, relative_version):
         """
         SUM over a PK range for a specific relative version.
-        Reconstruct each row's version via bitmask replay to guarantee correctness.
+        Each row is reconstructed *as of* that version by walking the tail chain
+        until every column is satisfied (or base is reached).
         """
         try:
             s, e = int(start_range), int(end_range)
             col = int(aggregate_column_index)
-            rv = int(relative_version)
+            rv_in = int(relative_version)
+            rv_index = (0 if rv_in >= 0 else -rv_in)  # 0->0, -1->1, -k->k
             total = 0
             deleted = getattr(self.table, "deleted", set())
 
@@ -443,26 +446,26 @@ class Query:
             if self.index.indices[self.table.key] is not None:
                 base_rids = self.index.locate_range(s, e, self.table.key)
             else:
+                # Fallback: scan page_directory for base records, filter by PK value
                 base_rids = []
                 tail_start = getattr(config, "TAIL_RID_START", 10**9)
                 key_col = config.META_COLUMNS + self.table.key
-                for rid in self.table.page_directory.keys():
-                    if isinstance(rid, str):
-                        if not rid.startswith('b'):
-                            continue
-                    else:
-                        if int(rid) >= tail_start:
-                            continue
+                for rid, locs in self.table.page_directory.items():
+                    # base only
+                    if (isinstance(rid, str) and not rid.startswith('b')) or \
+                    (not isinstance(rid, str) and int(rid) >= tail_start):
+                        continue
                     if rid in deleted:
                         continue
-                    pid, slot = self.table.page_directory[rid][key_col]
-                    if self.table.pageBuffer.get_page(pid).read(slot) in range(s, e + 1):
+                    pid, slot = locs[key_col]
+                    pk_val = int(self.table.pageBuffer.get_page(pid).read(slot))
+                    if s <= pk_val <= e:
                         base_rids.append(rid)
 
             for br in base_rids:
                 if br in deleted:
                     continue
-                row = self._materialize_version_values(br, rv)
+                row = self._compose_row_at_version(br, rv_index)
                 total += int(row[col])
 
             return total
@@ -494,49 +497,125 @@ class Query:
 
     def _materialize_version_values(self, base_rid, relative_version):
         """
-        Reconstruct a specific *relative* version of a row.
-
-        We do this by:
-        1) Collecting all tail RIDs that belong to this base_rid by following the
-            indirection pointers back to the base. For each RID we read its TIMESTAMP.
-        2) Sorting those tails by timestamp ascending (chronological).
-        3) Deciding how many tails to apply based on 'relative_version':
-                rv =  0  -> apply all tails   (latest)
-                rv = -1  -> apply all but last
-                rv = -k  -> apply len(tails) - k   (clamped at 0)
-        4) Starting from BASE user values, apply the chosen tails in chronological
-            order, using each tail's SCHEMA bitmask to decide which columns to copy.
+        Return the user-column values for the row as of a relative version.
+        0  -> newest (latest RID)
+        -1  -> one version older
+        -k  -> k versions older, clamped at base
+        Implementation: tails are cumulative, so just fetch the RID k steps back
+        and read its user columns directly.
         """
-        # 1) Walk back latest->...->base collecting tail RIDs + timestamps
-        tails = []   # list of (rid, ts)
-        cur = self.table._get_latest_rid(base_rid)
-        while cur != base_rid:
-            # TIMESTAMP is a meta column
-            pid_ts, slot_ts = self.table.page_directory[cur][config.TIMESTAMP_COLUMN]
-            ts = int(self.table.pageBuffer.get_page(pid_ts).read(slot_ts))
-            tails.append((cur, ts))
-            # follow indirection to previous
-            pid_in, slot_in = self.table.page_directory[cur][config.INDIRECTION_COLUMN]
-            prev = self.table.pageBuffer.get_page(pid_in).read(slot_in)
-            cur = base_rid if prev in (0, None) else prev
+        rid_at_version = self._get_version_rid(base_rid, int(relative_version))
+        return self._read_user_values_from_rid(rid_at_version)
 
-        # 2) chronological order
-        tails.sort(key=lambda x: x[1])   # [(rid, ts)] earliest ... latest
-        n = len(tails)
+    def _ensure_tail_maps(self):
+        """
+        Build one-time caches from page_directory so versioned reads are fast:
+        _prev_cache[tail_rid] -> previous rid (tail or base)
+        _ts_cache[tail_rid]   -> timestamp (int)
+        _head_cache[base_rid] -> newest tail rid for that base (0 if none)
+        Safe to call many times; it only builds once.
+        """
+        if hasattr(self, "_prev_cache"):
+            return
+        self._prev_cache = {}
+        self._ts_cache = {}
+        self._head_cache = {}
 
-        # 3) how many to apply?
-        rv = int(relative_version)
-        apply_cnt = n if rv >= 0 else max(0, n + rv)
+        pd = self.table.page_directory
+        tail_start = getattr(config, "TAIL_RID_START", 10**9)
 
-        # 4) apply bitmasks
+        # collect prev/timestamp for all tails
+        for rid, locs in pd.items():
+            try:
+                is_tail = (int(rid) >= tail_start)
+            except Exception:
+                is_tail = isinstance(rid, str) and rid.startswith('t')
+            if not is_tail:
+                continue
+            pid_in, slot_in = locs[config.INDIRECTION_COLUMN]
+            self._prev_cache[rid] = int(self.table.pageBuffer.get_page(pid_in).read(slot_in))
+            pid_ts, slot_ts = locs[config.TIMESTAMP_COLUMN]
+            self._ts_cache[rid] = int(self.table.pageBuffer.get_page(pid_ts).read(slot_ts))
+
+        # compute newest head per base (by timestamp)
+        for t in list(self._prev_cache.keys()):
+            base = self._prev_cache[t]
+            # walk to base once; cheap due to memoization of _prev_cache for tails
+            while base in self._prev_cache:         # while 'base' is actually a tail
+                base = self._prev_cache[base]
+            if not base:
+                continue
+            cur_head = self._head_cache.get(base, 0)
+            if (not cur_head) or (self._ts_cache[t] > self._ts_cache.get(cur_head, -1)):
+                self._head_cache[base] = t
+
+
+    def _collect_tail_chain(self, base_rid):
+        """
+        Return [newest_tail_rid, older..., oldest] for this base_rid.
+        Uses base's head pointer when present; otherwise uses the cached head.
+        """
+        self._ensure_tail_maps()
+
+        # try base's own head first
+        head = 0
+        try:
+            pid, slot = self.table.page_directory[base_rid][config.INDIRECTION_COLUMN]
+            head = int(self.table.pageBuffer.get_page(pid).read(slot))
+        except Exception:
+            head = 0
+        if not head:
+            head = self._head_cache.get(base_rid, 0)
+
+        # collect newest -> oldest via cached prev pointers (fall back to reading if needed)
+        tails = []
+        cur = head
+        while cur:
+            tails.append(cur)
+            cur = self._prev_cache.get(cur)
+            if cur is None:
+                # rare: prev not cached (e.g., inconsistent state) -> read once
+                pid_in, slot_in = self.table.page_directory[tails[-1]][config.INDIRECTION_COLUMN]
+                cur = int(self.table.pageBuffer.get_page(pid_in).read(slot_in))
+            if cur == tails[-1]:  # safety guard
+                break
+        return tails
+
+
+    def _compose_row_at_version(self, base_rid: int, rv_index: int):
+        """
+        Compose the row as of the version specified by a NON-NEGATIVE index:
+        rv_index = 0 -> newest (latest tail or base)
+        rv_index = 1 -> one version older (previous tail, or base if none)
+        rv_index = k -> k versions older, clamped to base if beyond oldest tail
+
+        NOTE: select_version/sum_version already convert relative_version (0,-1,-2,..)
+        into this non-negative rv_index. Do NOT remap here.
+        """
+        # start from base values
         row = self._read_user_values_from_rid(base_rid)
-        for i in range(apply_cnt):
-            tr, _ = tails[i]
-            # read schema/bitmask of this tail
+
+        tails = self._collect_tail_chain(base_rid)  # newest -> older -> ... -> oldest
+        if not tails:
+            return row
+
+        rv_index = int(rv_index)
+        if rv_index >= len(tails):
+            # older than oldest tail -> base row
+            return row
+
+        # Overlay from the chosen tail towards older tails until all cols are set.
+        n = self.table.num_columns
+        filled = [False] * n
+        for i in range(rv_index, len(tails)):
+            tr = tails[i]
             pid_s, slot_s = self.table.page_directory[tr][config.SCHEMA_ENCODING_COLUMN]
             bm = int(self.table.pageBuffer.get_page(pid_s).read(slot_s))
             tvals = self._read_user_values_from_rid(tr)
-            for c in range(self.table.num_columns):
-                if (bm >> c) & 1:
+            for c in range(n):
+                if ((bm >> c) & 1) and not filled[c]:
                     row[c] = tvals[c]
+                    filled[c] = True
+            if all(filled):
+                break
         return row

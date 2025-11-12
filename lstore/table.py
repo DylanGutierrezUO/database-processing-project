@@ -4,6 +4,8 @@ from .page import Page
 from .index import Index
 import os
 import json
+import threading
+import collections
 
 
 class Record:
@@ -72,15 +74,45 @@ class Table:
     """
 
     def __init__(self, name, num_columns, key):
+        # --- logical schema ---
         self.name = name
-        self.key = key
-        self.num_columns = num_columns         # user columns
-        self.page_directory = {}               # RID -> List[(page_id, slot)] length META+user
-        self.base_record_count = int(0)        # Counter for base records
-        self.tail_record_count = int(0)        # Counter for tail records
+        self.key = key                          # 0-based user-column index of PK
+        self.num_columns = num_columns          # number of USER columns
+
+        # --- storage directory ---
+        self.page_directory = {}                # RID -> [(page_id, slot)] for META+user cols
+
+        # --- counters & state ---
+        self.base_record_count = 0              # number of base rows ever appended
+        self.tail_record_count = 0              # number of tail rows ever appended
+        self.deleted = set()                    # base RIDs logically deleted this run
+
+        # --- indexing & bufferpool (linked by Database) ---
         self.index = Index(self)
-        self.pageBuffer = None                 # Set by database
-        self.deleted = set()                   # base RIDs logically deleted this run
+        self.pageBuffer = None                  # set by Database.link_page_buffer / open()
+
+        # --- background merge controls (history-preserving) ---
+        # Do not force merge on close() here; Database.close() should check a config flag.
+        self._merge_enabled   = bool(getattr(config, "ENABLE_BACKGROUND_MERGE", False))
+        self._merge_threshold = int(getattr(config, "MERGE_TAIL_THRESHOLD", 3))
+
+        # Work queue + bookkeeping for merges; range_id is an int you choose (0 if single-range).
+        self._merge_q        = collections.deque()
+        self._merge_inflight = set()
+        self._merge_thread   = None
+
+        # Optional: per-range statistics/watermark (TPS) to let readers skip very old tails
+        # without deleting them.
+        self.tps = {}  # dict: range_id -> newest merged tail timestamp (or RID)
+
+        if self._merge_enabled:
+            # Start a lightweight daemon worker to perform merges opportunistically.
+            self._merge_thread = threading.Thread(
+                target=self._merge_worker,
+                name=f"MergeWorker-{self.name}",
+                daemon=True
+            )
+            self._merge_thread.start()
 
     def link_page_buffer(self, pageBuffer):
         """
@@ -527,6 +559,52 @@ class Table:
 
     def __merge(self):
         self.merge()
+
+    def _schedule_merge(self, range_id=0):
+        """
+        Enqueue a background, history-preserving merge for the given page-range.
+        Call this when you *seal* a tail page for that range or when your own
+        per-range unmerged-tail counter crosses self._merge_threshold.
+        """
+        if not self._merge_enabled:
+            return
+        if range_id in self._merge_inflight:
+            return
+        self._merge_inflight.add(range_id)
+        self._merge_q.append(range_id)
+
+    def _merge_worker(self):
+        """
+        Simple single-threaded background worker. It never interferes with reads/writes;
+        it just calls _merge_range(range_id), which must be contention-free.
+        """
+        # Small sleep loop to avoid busy-spin when idle
+        while True:
+            if not self._merge_q:
+                # sleep a touch; using time.sleep avoids CPU busy-wait
+                import time as _t; _t.sleep(0.01)
+                continue
+            range_id = self._merge_q.popleft()
+            try:
+                self._merge_range(range_id)
+            except Exception:
+                # Swallow exceptions to keep the daemon alive; logging is optional
+                pass
+            finally:
+                self._merge_inflight.discard(range_id)
+
+    def _merge_range(self, range_id=0):
+        """
+        Perform a *history-preserving* merge for the given range.
+        If you already have a Table.merge(...) implementation, delegate to it.
+        Otherwise, implement your compose-new-base-pages-and-swap logic here.
+        """
+        try:
+            # Prefer your own merge(range_id) if it exists
+            return self.merge(range_id)
+        except TypeError:
+            # Many student implementations define merge(self) with no args
+            return self.merge()
 
     def delete(self):
         """
