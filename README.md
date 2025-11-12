@@ -3,8 +3,12 @@
 Acknowledgments and Thanks to Prof. Mohammad Sadoghi (UC Davis)
 
 # M2 Testing information
+Standard m2 tests:
+python3 -u m2_tester_part1.py
+python3 -u m2_tester_part2.py
 
-m2_tester_part1.py creates data that is used by m2_tester_part2.py
-- !Important! Delete the created data BEFORE running exam_tester_m2_part1.py!
+- !Important! Delete the data created by m2_tester_part1 BEFORE running exam_tester_m2_part1!
 
-exam_tester_m2_part1.py creates data that is used by exam_tester_m2_part2.py
+Exam m2 tests:
+python3 -u exam_tester_m2_part1.py
+python3 -u exam_tester_m2_part2.py
