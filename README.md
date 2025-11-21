@@ -115,6 +115,20 @@ python3 -u exam_tester_m2_part2.py
 
 
 
+# Transaction workers
+
+    lstore/transaction_worker.py
+
+        - Threaded execution: each worker runs transactions in a separate thread for true parallelism.
+
+        - Sequential processing: executes assigned transactions one-by-one within its thread.
+
+        - Stats tracking: records commit/abort status for each transaction; stores count of successful commits in result.
+
+        - Synchronization: provides join() to wait for worker thread completion before main thread proceeds.
+
+
+
 # Storage model & lineage (what we implement)
 
     - Base pages store original inserts; tail pages store updates.
