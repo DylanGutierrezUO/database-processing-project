@@ -99,6 +99,22 @@ python3 -u exam_tester_m2_part2.py
 
 
 
+# Concurrency control
+
+    lstore/lock_manager.py
+
+        - Two-Phase Locking (2PL) with no-wait policy: transactions abort immediately on conflict (raise LockException).
+
+        - Per-RID locking: multiple transactions can hold shared locks; only one can hold exclusive.
+
+        - Lock upgrade: transaction holding shared lock can upgrade to exclusive if it's the sole holder.
+
+        - Thread-safe: global lock protects lock table; all acquire/release operations are atomic.
+
+        - release_all(txn_id): releases all locks held by a transaction (used on commit/abort).
+
+
+
 # Storage model & lineage (what we implement)
 
     - Base pages store original inserts; tail pages store updates.
