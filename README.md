@@ -115,6 +115,20 @@ python3 -u exam_tester_m2_part2.py
 
 
 
+# Transactions
+
+    lstore/transaction.py
+
+        - Transaction ID generation: each transaction gets unique ID via thread-safe counter.
+
+        - Lock manager integration: global lock manager shared across all transactions; thread-local storage tracks current txn_id.
+
+        - Atomicity: run() executes all queries; aborts and releases locks on any failure or LockException.
+
+        - Lock release: both commit() and abort() release all locks held by the transaction.
+
+
+
 # Transaction workers
 
     lstore/transaction_worker.py
@@ -122,6 +136,8 @@ python3 -u exam_tester_m2_part2.py
         - Threaded execution: each worker runs transactions in a separate thread for true parallelism.
 
         - Sequential processing: executes assigned transactions one-by-one within its thread.
+
+        - Retry logic: aborted transactions are retried in infinite loop until they commit (no-wait 2PL requirement).
 
         - Stats tracking: records commit/abort status for each transaction; stores count of successful commits in result.
 

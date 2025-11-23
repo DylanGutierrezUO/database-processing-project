@@ -35,7 +35,12 @@ class TransactionWorker:
 
     def __run(self):
         for transaction in self.transactions:
-            # each transaction returns True if committed or False if aborted
-            self.stats.append(transaction.run())
-        # stores the number of transactions that committed
-        self.result = len(list(filter(lambda x: x, self.stats)))
+            # Keep retrying until transaction commits
+            while True:
+                # each transaction returns True if committed or False if aborted
+                result = transaction.run()
+                if result:  # Transaction committed successfully
+                    self.stats.append(True)
+                    self.result += 1
+                    break
+                # else: Transaction aborted, retry
