@@ -91,6 +91,11 @@ class Table:
         self.index = Index(self)
         self.pageBuffer = None                  # set by Database.link_page_buffer / open()
 
+        # --- M3: concurrency control ---
+        from lstore.transaction import _global_lock_manager
+        self.lock_manager = _global_lock_manager  # Shared lock manager for concurrency control
+        self._table_lock = threading.Lock()  # Protects table metadata operations
+
         # --- background merge controls (history-preserving) ---
         # Do not force merge on close() here; Database.close() should check a config flag.
         self._merge_enabled   = bool(getattr(config, "ENABLE_BACKGROUND_MERGE", False))
@@ -255,47 +260,48 @@ class Table:
         """
         Append a new base record; enforces PK uniqueness.
         """
-        user_cols = self.num_columns
-        if len(columns) != user_cols:
-            return False
+        with self._table_lock:  # M3: Protect concurrent inserts
+            user_cols = self.num_columns
+            if len(columns) != user_cols:
+                return False
 
-        pk_val = columns[self.key]
+            pk_val = columns[self.key]
 
-        # Fast path: PK index exists
-        pk_idx = self.index.indices[self.key]
-        if pk_idx is not None and pk_val in pk_idx:
-            return False
+            # Fast path: PK index exists
+            pk_idx = self.index.indices[self.key]
+            if pk_idx is not None and pk_val in pk_idx:
+                return False
 
-        # Fallback: scan base key cells (PK is immutable)
-        if pk_idx is None:
-            key_col = config.META_COLUMNS + self.key
-            for rid in self.page_directory.keys():
-                if not self._is_base_rid(rid) or (rid in self.deleted):
-                    continue
-                pid, slot = self.page_directory[rid][key_col]
-                page = self.pageBuffer.get_page(pid)
-                if page.read(slot) == pk_val:
-                    return False
+            # Fallback: scan base key cells (PK is immutable)
+            if pk_idx is None:
+                key_col = config.META_COLUMNS + self.key
+                for rid in self.page_directory.keys():
+                    if not self._is_base_rid(rid) or (rid in self.deleted):
+                        continue
+                    pid, slot = self.page_directory[rid][key_col]
+                    page = self.pageBuffer.get_page(pid)
+                    if page.read(slot) == pk_val:
+                        return False
 
-        # Generate new base RID
-        rid = self._generate_rid("base")
+            # Generate new base RID
+            rid = self._generate_rid("base")
 
-        # Metadata (ints)
-        indirection = 0
-        timestamp = self._ts_millis()
-        schema_encoding = 0
+            # Metadata (ints)
+            indirection = 0
+            timestamp = self._ts_millis()
+            schema_encoding = 0
 
-        full_record = [indirection, rid, timestamp, schema_encoding] + list(columns)
+            full_record = [indirection, rid, timestamp, schema_encoding] + list(columns)
 
-        # Write to base pages
-        self._write_to_base_pages(rid, full_record)
+            # Write to base pages
+            self._write_to_base_pages(rid, full_record)
 
-        # Update indices (PK and any others)
-        for col_index in range(user_cols):
-            if getattr(self.index, "indices", None) and self.index.indices[col_index] is not None:
-                self.index.insert_entry(rid, col_index, columns[col_index])
+            # Update indices (PK and any others)
+            for col_index in range(user_cols):
+                if getattr(self.index, "indices", None) and self.index.indices[col_index] is not None:
+                    self.index.insert_entry(rid, col_index, columns[col_index])
 
-        return True
+            return True
 
     def _write_to_base_pages(self, rid, full_record):
         """
@@ -349,59 +355,60 @@ class Table:
         `columns` is a full user-length vector where None means "no change".
         Returns True on success; False on any contract violation.
         """
-        try:
-            user_cols = self.num_columns
-            if len(columns) != user_cols:
+        with self._table_lock:  # M3: Protect concurrent updates
+            try:
+                user_cols = self.num_columns
+                if len(columns) != user_cols:
+                    return False
+                if base_rid not in self.page_directory:
+                    return False
+
+                # ---- helpers (local) ----
+                def _read_user_values_for_rid(rid):
+                    vals = []
+                    for i in range(user_cols):
+                        pid, slot = self.page_directory[rid][4 + i]
+                        vals.append(self.pageBuffer.get_page(pid).read(slot))
+                    return vals
+
+                def _latest_rid_for_base(rid0):
+                    # Base's INDIRECTION points to latest tail (0 if none).
+                    pid, slot = self.page_directory[rid0][config.INDIRECTION_COLUMN]
+                    latest = self.pageBuffer.get_page(pid).read(slot)
+                    return rid0 if (latest in (0, None)) else latest
+
+                # ---- materialize current latest ----
+                latest_rid = _latest_rid_for_base(base_rid)
+                current = _read_user_values_for_rid(latest_rid)
+
+                # ---- fill new values + build bitmask (int) ----
+                new_vals = list(current)
+                bitmask = 0
+                for i, v in enumerate(columns):
+                    if v is not None and v != current[i]:
+                        new_vals[i] = int(v)
+                        bitmask |= (1 << i)
+
+                if bitmask == 0:
+                    return True  # no-op update
+
+                # ---- craft the tail record (cumulative) ----
+                new_tail_rid = self._generate_rid("tail")
+                ts = int(time.time() * 1000)
+                prev_ptr = latest_rid if latest_rid != base_rid else 0  # 0 signals base
+
+                full_tail = [prev_ptr, new_tail_rid, ts, bitmask] + new_vals
+                self._write_to_tail_pages(new_tail_rid, full_tail)
+
+                # ---- bump base indirection to the NEW tail (in place) ----
+                pid, slot = self.page_directory[base_rid][config.INDIRECTION_COLUMN]
+                page = self.pageBuffer.get_page(pid)
+                page.write_at(slot, new_tail_rid)
+                self.pageBuffer.mark_dirty(pid)
+
+                return True
+            except Exception:
                 return False
-            if base_rid not in self.page_directory:
-                return False
-
-            # ---- helpers (local) ----
-            def _read_user_values_for_rid(rid):
-                vals = []
-                for i in range(user_cols):
-                    pid, slot = self.page_directory[rid][4 + i]
-                    vals.append(self.pageBuffer.get_page(pid).read(slot))
-                return vals
-
-            def _latest_rid_for_base(rid0):
-                # Base's INDIRECTION points to latest tail (0 if none).
-                pid, slot = self.page_directory[rid0][config.INDIRECTION_COLUMN]
-                latest = self.pageBuffer.get_page(pid).read(slot)
-                return rid0 if (latest in (0, None)) else latest
-
-            # ---- materialize current latest ----
-            latest_rid = _latest_rid_for_base(base_rid)
-            current = _read_user_values_for_rid(latest_rid)
-
-            # ---- fill new values + build bitmask (int) ----
-            new_vals = list(current)
-            bitmask = 0
-            for i, v in enumerate(columns):
-                if v is not None and v != current[i]:
-                    new_vals[i] = int(v)
-                    bitmask |= (1 << i)
-
-            if bitmask == 0:
-                return True  # no-op update
-
-            # ---- craft the tail record (cumulative) ----
-            new_tail_rid = self._generate_rid("tail")
-            ts = int(time.time() * 1000)
-            prev_ptr = latest_rid if latest_rid != base_rid else 0  # 0 signals base
-
-            full_tail = [prev_ptr, new_tail_rid, ts, bitmask] + new_vals
-            self._write_to_tail_pages(new_tail_rid, full_tail)
-
-            # ---- bump base indirection to the NEW tail (in place) ----
-            pid, slot = self.page_directory[base_rid][config.INDIRECTION_COLUMN]
-            page = self.pageBuffer.get_page(pid)
-            page.write_at(slot, new_tail_rid)
-            self.pageBuffer.mark_dirty(pid)
-
-            return True
-        except Exception:
-            return False
 
     # ---------- buffer hooks for Bufferpool ----------
 

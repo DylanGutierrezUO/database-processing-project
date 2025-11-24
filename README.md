@@ -145,6 +145,42 @@ python3 -u exam_tester_m2_part2.py
 
 
 
+# M3: Query-level lock acquisition
+
+    lstore/query.py
+
+        - Lock integration: all CRUD operations acquire appropriate locks before data access.
+
+        - insert(): acquires exclusive lock on new RID after successful insert.
+
+        - select(): acquires shared lock on each RID before reading (supports PK, secondary index, and full scan paths).
+
+        - update(): acquires exclusive lock on target RID before modification.
+
+        - delete(): acquires exclusive lock on target RID before logical deletion.
+
+        - Error handling: all methods catch LockException and return False to signal transaction abort.
+
+        - Thread-local transaction tracking: uses get_current_txn_id() to retrieve active transaction ID from thread-local storage.
+
+
+
+# M3: Table-level thread safety
+
+    lstore/table.py
+
+        - Table lock: added self._table_lock (threading.Lock) to protect critical table operations.
+
+        - insert_row() protection: wrapped entire method in "with self._table_lock" to prevent concurrent insert corruption.
+
+        - update_row() protection: wrapped entire method in "with self._table_lock" to prevent concurrent update corruption.
+
+        - Prevents race conditions: ensures atomic operations on page_directory, counters, and index updates.
+
+        - Lock manager reference: each table maintains reference to global lock manager for record-level locking.
+
+
+
 # Storage model & lineage (what we implement)
 
     - Base pages store original inserts; tail pages store updates.

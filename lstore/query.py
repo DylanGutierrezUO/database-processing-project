@@ -1,6 +1,15 @@
 from lstore.table import Table, Record
 from lstore.index import Index
 from lstore import config
+from lstore.lock_manager import LockException
+
+# M3: Helper function to get current transaction ID from thread-local storage
+def get_current_txn_id():
+    """Get current transaction ID from thread-local storage."""
+    from lstore.transaction import _current_transaction
+    if not hasattr(_current_transaction, 'txn_id'):
+        return None
+    return _current_transaction.txn_id
 
 
 class Query:
@@ -241,6 +250,12 @@ class Query:
             rid = self._pk_to_rid(primary_key)
             if rid is None:
                 return False
+            
+            # M3: Acquire exclusive lock for delete
+            txn_id = get_current_txn_id()
+            if txn_id is not None and hasattr(self.table, 'lock_manager'):
+                self.table.lock_manager.acquire_exclusive(txn_id, rid)
+            
             idx = self.index.indices[self.table.key]
             if idx and primary_key in idx:
                 idx.pop(primary_key, None)
@@ -248,6 +263,8 @@ class Query:
                 self.table.deleted = set()
             self.table.deleted.add(rid)
             return True
+        except LockException: # M3: Handle lock conflicts
+            return False
         except Exception:
             return False
 
@@ -265,7 +282,21 @@ class Query:
             bool: True on success; False on failure.
         """
         try:
-            return self.table.insert_row(*columns)
+            # Perform the insert first
+            result = self.table.insert_row(*columns)
+            
+            # M3: After successful insert, acquire exclusive lock on the new RID
+            if result:
+                txn_id = get_current_txn_id()
+                if txn_id is not None and hasattr(self.table, 'lock_manager'):
+                    pk_value = columns[self.table.key]
+                    new_rid = self._pk_to_rid(pk_value)
+                    if new_rid is not None:
+                        self.table.lock_manager.acquire_exclusive(txn_id, new_rid)
+            
+            return result
+        except LockException: # M3: Handle lock conflicts
+            return False
         except Exception:
             return False
 
@@ -280,11 +311,15 @@ class Query:
             proj = self._proj(projected_columns_index)
             rows = []
             deleted = getattr(self.table, "deleted", set())
+            txn_id = get_current_txn_id()
 
             # ---------- Primary-key predicate ----------
             if int(search_key_index) == int(self.table.key):
                 rid = self._pk_to_rid(search_key)
                 if rid is not None and rid not in deleted:
+                    # M3: Acquire shared lock for read
+                    if txn_id is not None and hasattr(self.table, 'lock_manager'):
+                        self.table.lock_manager.acquire_shared(txn_id, rid)
                     rows.append(self._latest_user_values(rid))
                     return self._make_records(rows, proj)
 
@@ -327,6 +362,9 @@ class Query:
             if rids_from_index:
                 for rid in rids_from_index:
                     if self._is_base_rid(rid) and rid not in deleted:
+                        # M3: Acquire shared lock for each record
+                        if txn_id is not None and hasattr(self.table, 'lock_manager'):
+                            self.table.lock_manager.acquire_shared(txn_id, rid)
                         rows.append(self._latest_user_values(rid))
                 return self._make_records(rows, proj)
 
@@ -343,9 +381,14 @@ class Query:
                     continue
                 vals = self._latest_user_values(rid)
                 if vals[search_key_index] == search_key:
+                    # M3: Acquire shared lock for each matched record
+                    if txn_id is not None and hasattr(self.table, 'lock_manager'):
+                        self.table.lock_manager.acquire_shared(txn_id, rid)
                     rows.append(vals)
             return self._make_records(rows, proj)
 
+        except LockException: # M3: Handle lock conflicts
+            return []
         except Exception:
             # Safer for tester that immediately indexes [0]
             return []
@@ -395,10 +438,17 @@ class Query:
             rid = self._pk_to_rid(primary_key)
             if rid is None or rid in getattr(self.table, "deleted", set()):
                 return False
+            
+            # M3: Acquire exclusive lock for update
+            txn_id = get_current_txn_id()
+            if txn_id is not None and hasattr(self.table, 'lock_manager'):
+                self.table.lock_manager.acquire_exclusive(txn_id, rid)
 
             current = self._latest_user_values(rid)
             filled = [current[i] if columns[i] is None else columns[i] for i in range(n)]
             return self.table.update_row(rid, *filled)
+        except LockException: # M3: Handle lock conflicts
+            return False
         except Exception:
             return False
 

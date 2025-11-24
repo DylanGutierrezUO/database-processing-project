@@ -1,4 +1,5 @@
 import threading
+import time
 from lstore.table import Table, Record
 from lstore.index import Index
 
@@ -36,6 +37,7 @@ class TransactionWorker:
     def __run(self):
         for transaction in self.transactions:
             # Keep retrying until transaction commits
+            retry_count = 0
             while True:
                 # each transaction returns True if committed or False if aborted
                 result = transaction.run()
@@ -43,4 +45,6 @@ class TransactionWorker:
                     self.stats.append(True)
                     self.result += 1
                     break
-                # else: Transaction aborted, retry
+                # else: Transaction aborted, retry with exponential backoff
+                retry_count += 1
+                time.sleep(0.001 * min(retry_count, 10))  # Max 10ms delay
