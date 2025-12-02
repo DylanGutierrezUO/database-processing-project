@@ -42,7 +42,7 @@ class LockManager:
             
             # Upgrade from shared to exclusive (only if sole holder)
             if txn_id in entry['shared']:
-                if len(entry['shared']) == 1:
+                if len(entry['shared']) == 1 and entry['shared'][0] == txn_id:
                     entry['shared'].remove(txn_id)
                     entry['exclusive'] = txn_id
                     return

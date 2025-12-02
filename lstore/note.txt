@@ -1,0 +1,7 @@
+Ensure garbage collection (tail-pruning) only happens BETWEEN TRANSACTIONs
+    Do not delete to the point where no "non-deleted" nodes exist in a RID's history,
+    Aborted txs can "mark-deleted", but not remove them from the chain.
+    In turn, improve GC to remove these "marked-deleted" nodes from chain.
+
+Ensure that lock-acquisition is NON-BLOCKING, I believe this might be what is holding our loop.
+ 
