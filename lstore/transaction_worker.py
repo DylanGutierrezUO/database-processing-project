@@ -35,16 +35,28 @@ class TransactionWorker:
             self.thread.join()
 
     def __run(self):
+        MAX_RETRIES = 100
+        
+        # Process each transaction in the batch
         for transaction in self.transactions:
-            # Keep retrying until transaction commits
             retry_count = 0
-            while True:
-                # each transaction returns True if committed or False if aborted
+            
+            # Retry loop with exponential backoff
+            while retry_count < MAX_RETRIES:
                 result = transaction.run()
-                if result:  # Transaction committed successfully
+                
+                # Transaction succeeded
+                if result:
                     self.stats.append(True)
                     self.result += 1
                     break
-                # else: Transaction aborted, retry with exponential backoff
+                
+                # Transaction aborted - backoff before retry
                 retry_count += 1
-                time.sleep(0.001 * min(retry_count, 10))  # Max 10ms delay
+                delay = 0.001 * min(retry_count, 10)  # 10ms delay
+                jitter = delay * 0.5 * (hash(threading.current_thread()) % 100) / 100
+                time.sleep(delay + jitter)
+            
+            # Max retries exceeded
+            else:
+                self.stats.append(False)
