@@ -256,6 +256,12 @@ class Query:
             if txn_id is not None and hasattr(self.table, 'lock_manager'):
                 self.table.lock_manager.acquire_exclusive(txn_id, rid)
             
+            # Track for rollback before deleting
+            from lstore.transaction import get_current_transaction
+            txn = get_current_transaction()
+            if txn is not None:
+                txn.deleted_rids.append((self.table, rid))
+            
             idx = self.index.indices[self.table.key]
             if idx and primary_key in idx:
                 idx.pop(primary_key, None)
@@ -293,6 +299,11 @@ class Query:
                     new_rid = self._pk_to_rid(pk_value)
                     if new_rid is not None:
                         self.table.lock_manager.acquire_exclusive(txn_id, new_rid)
+                        # Track for rollback
+                        from lstore.transaction import get_current_transaction
+                        txn = get_current_transaction()
+                        if txn is not None:
+                            txn.inserted_rids.append((self.table, new_rid))
             
             return result
         except LockException: # M3: Handle lock conflicts
@@ -444,9 +455,30 @@ class Query:
             if txn_id is not None and hasattr(self.table, 'lock_manager'):
                 self.table.lock_manager.acquire_exclusive(txn_id, rid)
 
+            # Capture old values and indirection before update for rollback
             current = self._latest_user_values(rid)
+            prev_indirection = 0
+            try:
+                if rid in self.table.page_directory:
+                    pid, slot = self.table.page_directory[rid][config.INDIRECTION_COLUMN]
+                    page = self.table.pageBuffer.get_page(pid)
+                    prev_indirection = page.read(slot)
+                    if prev_indirection in (0, None):
+                        prev_indirection = 0
+            except:
+                prev_indirection = 0
+            
             filled = [current[i] if columns[i] is None else columns[i] for i in range(n)]
-            return self.table.update_row(rid, *filled)
+            result = self.table.update_row(rid, *filled)
+            
+            # Track for rollback if successful
+            if result:
+                from lstore.transaction import get_current_transaction
+                txn = get_current_transaction()
+                if txn is not None:
+                    txn.updated_rids.append((self.table, rid, prev_indirection, current))
+            
+            return result
         except LockException: # M3: Handle lock conflicts
             return False
         except Exception:
